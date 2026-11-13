@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# ALOOZ HOSTING VPS bot - one-command installer for Debian/Ubuntu.
+# ALOOZ HOSTING VPS bot - single-file installer for Debian/Ubuntu.
 #
 # SINGLE-FILE VERSION: every bot file is embedded below, so this is the only
 # file you need to upload to GitHub. Nothing else is downloaded or cloned.
 #
 # One click (as root):
-#   sudo bash <(curl -fsSL https://raw.githubusercontent.com/skphdplayz/vps-deploy-bot/main/install.sh)
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/skphdplayz/vps-deploy-bot/main/install.sh)"
 #
 # Re-running it rewrites the bot code and restarts it (your .env is kept).
-set -euo pipefail
+set -Eeuo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/alooz-bot}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE="alooz-bot"
 PORT_START=20000
 PORT_END=20999
@@ -36,7 +37,7 @@ show_banner() {
     [G]=" ####|#    |#  ##|#   #| ### "
     [_]="   |   |   |   |   "
   )
-  local n i ch x r row c line cols frame width
+  local n i ch x r row c line frame width
   local -a parts
 
   for ((n = 0; n < ${#text}; n++)); do
@@ -103,17 +104,16 @@ show_banner
 [ "${ALOOZ_BANNER_ONLY:-0}" = "1" ] && exit 0
 
 # ----------------------------------------------------------------------
-# Installer
+# Helpers
 # ----------------------------------------------------------------------
-say() { printf '\033[1;36m[ALOOZ]\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "Please run as root (use sudo)."
-command -v apt-get >/dev/null 2>&1 || die "Only Debian and Ubuntu are supported."
+say()  { printf '\033[1;36m[ALOOZ]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+trap 'warn "The installer stopped at line $LINENO. Scroll up to see the reason."' ERR
 
 ask() { # ask VARIABLE "Question" [secret]
   local var="$1" text="$2" secret="${3:-}" value=""
-  [ -r /dev/tty ] || die "No terminal available. Set $var as an environment variable and run again."
+  { true </dev/tty; } 2>/dev/null || die "No terminal available. Run it from an SSH terminal, or set $var as an environment variable first."
   if [ -n "$secret" ]; then
     read -r -s -p "$text: " value </dev/tty
     echo
@@ -123,22 +123,69 @@ ask() { # ask VARIABLE "Question" [secret]
   printf -v "$var" '%s' "$value"
 }
 
-say "Installing system packages (python3, curl)..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y curl python3 python3-pip python3-venv \
-  || die "Could not install python3/curl. Fix apt first: apt --fix-broken install   (and check: apt-mark showhold)"
+# ----------------------------------------------------------------------
+# Pre-flight checks
+# ----------------------------------------------------------------------
+[ "$(id -u)" -eq 0 ] || die "Please run as root. Switch with:  sudo -i   then run the command again."
+if [ -r /etc/os-release ]; then . /etc/os-release; fi
+case "${ID:-}-${ID_LIKE:-}" in
+  *debian*|*ubuntu*) ;;
+  *) die "Only Debian and Ubuntu are supported (this server is: ${PRETTY_NAME:-unknown})." ;;
+esac
+command -v apt-get >/dev/null 2>&1 || die "apt-get was not found. Only Debian and Ubuntu are supported."
+
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+APT=(apt-get -y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
+
+repair_apt() {
+  dpkg --configure -a >/dev/null 2>&1 || true
+  "${APT[@]}" -f install >/dev/null 2>&1 || true
+}
+
+apt_install() { "${APT[@]}" install "$@"; }
+
+apt_install_retry() {
+  apt_install "$@" && return 0
+  warn "Package install failed. Repairing apt and trying once more..."
+  repair_apt
+  "${APT[@]}" update >/dev/null 2>&1 || true
+  apt_install --fix-missing "$@"
+}
+
+# ----------------------------------------------------------------------
+# System packages
+# ----------------------------------------------------------------------
+say "Preparing the system (this can take a minute on a fresh server)..."
+repair_apt
+"${APT[@]}" update || warn "apt update reported problems, continuing anyway."
+
+say "Installing Python and tools..."
+apt_install_retry curl ca-certificates python3 python3-venv python3-pip \
+  || die "Could not install python3/curl. Try: apt --fix-broken install   and check: apt-mark showhold"
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' \
+  || die "Python 3.8 or newer is required (found: $(python3 -V 2>&1)). Use Ubuntu 22.04+ or Debian 12+."
 
 if command -v docker >/dev/null 2>&1; then
-  say "Docker is already installed, skipping."
+  say "Docker is already installed."
 else
   say "Installing Docker..."
-  apt-get install -y docker.io \
-    || die "Could not install docker.io (package conflict). Run: dpkg -l | grep -E 'docker|containerd'  and  apt-mark showhold"
+  if ! apt_install_retry docker.io; then
+    warn "docker.io could not be installed from apt. Trying Docker's official install script (get.docker.com)..."
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh \
+      || die "Docker installation failed. Send the output of:  dpkg -l | grep -E 'docker|containerd'   and   apt-mark showhold"
+  fi
 fi
-systemctl enable --now docker >/dev/null 2>&1 || true
-docker info >/dev/null 2>&1 || die "Docker is installed but not running. Check: systemctl status docker"
+systemctl enable --now docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  docker info >/dev/null 2>&1 && break
+  sleep 2
+done
+docker info >/dev/null 2>&1 \
+  || die "Docker is installed but not running. Check: systemctl status docker   (some VPS types, like OpenVZ or LXC, cannot run Docker at all)"
 
+# ----------------------------------------------------------------------
+# Bot files
+# ----------------------------------------------------------------------
 say "Writing bot files to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 cat > "$INSTALL_DIR/main.py" <<'__ALOOZ_EOF__'
@@ -150,13 +197,15 @@ import sys
 import config
 from banner import play_banner
 
+EXIT_BAD_CONFIG = 78  # systemd unit uses RestartPreventExitStatus=78 so a bad token does not loop
+
 
 def main() -> None:
     play_banner()
 
     if not config.TOKEN:
         print("ERROR: DISCORD_TOKEN is missing. Copy .env.example to .env and fill it in.")
-        sys.exit(1)
+        sys.exit(EXIT_BAD_CONFIG)
     if not (config.OWNER_ID or config.ADMIN_IDS):
         print("WARNING: OWNER_ID and ADMIN_IDS are empty, so nobody can use admin commands.")
 
@@ -165,9 +214,15 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    import discord
+
     from bot import bot  # imported after the banner so the banner always shows first
 
-    bot.run(config.TOKEN, log_handler=None)
+    try:
+        bot.run(config.TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        print("ERROR: Discord rejected the bot token. Reset it in the Developer Portal and update .env.")
+        sys.exit(EXIT_BAD_CONFIG)
 
 
 if __name__ == "__main__":
@@ -196,7 +251,6 @@ from database import Database
 log = logging.getLogger("alooz")
 
 db = Database(config.DB_PATH)
-deploy_lock = asyncio.Lock()
 
 STATUS_EMOJI = {
     "running": "\U0001F7E2",
@@ -330,8 +384,10 @@ class ConfirmView(discord.ui.View):
 class AloozBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.default())
+        self.deploy_lock: Optional[asyncio.Lock] = None
 
     async def setup_hook(self) -> None:
+        self.deploy_lock = asyncio.Lock()  # created inside the running loop
         await self.tree.sync()
 
     async def on_ready(self) -> None:
@@ -390,7 +446,7 @@ async def deploy(
     image = os_image.value if os_image else OS_CHOICES[0].value
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    async with deploy_lock:
+    async with bot.deploy_lock:
         port = pick_port()
         if port is None:
             await interaction.followup.send("No free SSH ports are left in the configured range.", ephemeral=True)
@@ -1227,29 +1283,100 @@ discord.py>=2.3.2
 python-dotenv>=1.0.0
 __ALOOZ_EOF__
 
-say "Installing Python packages..."
-python3 -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
-"$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+# ----------------------------------------------------------------------
+# Python environment
+# ----------------------------------------------------------------------
+say "Setting up the Python environment..."
+if [ -d "$INSTALL_DIR/venv" ] && [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
+  rm -rf "$INSTALL_DIR/venv"
+fi
+if python3 -m venv "$INSTALL_DIR/venv" >/dev/null 2>&1 && [ -x "$INSTALL_DIR/venv/bin/pip" ]; then
+  PY="$INSTALL_DIR/venv/bin/python"
+  "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
+    || die "pip could not install the bot's packages. Check that this server has internet access."
+else
+  warn "Python venv is not available, using system Python instead."
+  PY="$(command -v python3)"
+  python3 -m pip install -q --break-system-packages -r "$INSTALL_DIR/requirements.txt" 2>/dev/null \
+    || python3 -m pip install -q -r "$INSTALL_DIR/requirements.txt" \
+    || die "pip could not install the bot's packages. Check that this server has internet access."
+fi
+"$PY" -c 'import discord' || die "discord.py did not install correctly."
+
+# ----------------------------------------------------------------------
+# Settings (.env)
+# ----------------------------------------------------------------------
+BOT_ID=""
+validate_token() { # returns 0 = valid, 1 = rejected by Discord, 2 = could not check
+  local tmp code
+  tmp="$(mktemp)"
+  code="$(curl -sS -m 15 -o "$tmp" -w '%{http_code}' -H "Authorization: Bot $1" \
+    https://discord.com/api/v10/users/@me 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then
+    BOT_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$tmp" 2>/dev/null || true)"
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  [ "$code" = "401" ] && return 1
+  return 2
+}
 
 ENV_FILE="$INSTALL_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
   say ".env already exists, keeping your current settings."
+  EXISTING_TOKEN="$(grep -E '^DISCORD_TOKEN=' "$ENV_FILE" | head -n1 | cut -d= -f2- || true)"
+  if [ -n "$EXISTING_TOKEN" ]; then validate_token "$EXISTING_TOKEN" || true; fi
 else
   DISCORD_TOKEN="${DISCORD_TOKEN:-}"
   OWNER_ID="${OWNER_ID:-}"
-  [ -n "$DISCORD_TOKEN" ] || ask DISCORD_TOKEN "Paste your Discord bot token (nothing shows while you paste)" secret
-  [ -n "$OWNER_ID" ]      || ask OWNER_ID "Enter your Discord owner ID"
+  PRESET_TOKEN=0
+  [ -n "$DISCORD_TOKEN" ] && PRESET_TOKEN=1
 
-  case "$DISCORD_TOKEN" in ""|*[[:space:]]*) die "The bot token is empty or contains spaces." ;; esac
-  case "$OWNER_ID" in ""|*[!0-9]*) die "Owner ID must be numbers only." ;; esac
+  attempts=0
+  while :; do
+    attempts=$((attempts + 1))
+    [ -n "$DISCORD_TOKEN" ] || ask DISCORD_TOKEN "Paste your Discord bot token (nothing shows while you paste)" secret
+    DISCORD_TOKEN="$(printf '%s' "$DISCORD_TOKEN" | tr -d '[:space:]')"
+    if [ -n "$DISCORD_TOKEN" ]; then
+      rc=0
+      validate_token "$DISCORD_TOKEN" || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        say "Bot token accepted by Discord."
+        break
+      elif [ "$rc" -eq 2 ]; then
+        warn "Could not reach Discord to verify the token. Continuing without a check."
+        break
+      fi
+      warn "Discord rejected this token. Reset it in the Developer Portal (Bot -> Reset Token) and paste the new one."
+    else
+      warn "The token was empty."
+    fi
+    [ "$PRESET_TOKEN" -eq 0 ] || die "The DISCORD_TOKEN you provided is not valid."
+    [ "$attempts" -lt 3 ] || die "Too many wrong attempts. Run the installer again with a valid token."
+    DISCORD_TOKEN=""
+  done
 
-  SERVER_IP="${SERVER_IP:-$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)}"
-  case "$SERVER_IP" in ""|*[!0-9a-fA-F.:]*) SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')" ;; esac
-  say "Server IP for SSH details: $SERVER_IP"
+  attempts=0
+  while ! [[ "$OWNER_ID" =~ ^[0-9]{15,22}$ ]]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -le 3 ] || die "Owner ID must be a long number like 123456789012345678."
+    [ -z "$OWNER_ID" ] || warn "Owner ID must be numbers only (about 18 digits). Discord: Settings -> Advanced -> Developer Mode, then right click yourself -> Copy User ID."
+    ask OWNER_ID "Enter your Discord owner ID"
+    OWNER_ID="$(printf '%s' "$OWNER_ID" | tr -d '[:space:]')"
+  done
 
-  umask 077
-  cat > "$ENV_FILE" <<EOF
+  SERVER_IP="${SERVER_IP:-$(curl -fsS -m 6 https://api.ipify.org 2>/dev/null || true)}"
+  case "$SERVER_IP" in ""|*[!0-9a-fA-F.:]*) SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)" ;; esac
+  if [ -z "$SERVER_IP" ]; then
+    warn "Could not detect the server IP. Edit SERVER_IP in $ENV_FILE later."
+    SERVER_IP="YOUR_SERVER_IP"
+  fi
+  say "Server IP used in SSH details: $SERVER_IP"
+
+  (
+    umask 077
+    cat > "$ENV_FILE" <<EOF
 DISCORD_TOKEN=$DISCORD_TOKEN
 OWNER_ID=$OWNER_ID
 ADMIN_IDS=
@@ -1259,37 +1386,70 @@ PORT_END=$PORT_END
 USE_DISK_LIMIT=false
 DB_PATH=$INSTALL_DIR/alooz_hosting.db
 EOF
+  )
   chmod 600 "$ENV_FILE"
   say "Saved settings to $ENV_FILE"
 fi
 
-say "Creating the system service..."
-cat > "/etc/systemd/system/$SERVICE.service" <<EOF
+# ----------------------------------------------------------------------
+# Start the bot
+# ----------------------------------------------------------------------
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  say "Creating the system service..."
+  cat > "$SYSTEMD_DIR/$SERVICE.service" <<EOF
 [Unit]
 Description=ALOOZ HOSTING VPS bot
 After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+Wants=network-online.target docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=6
 
 [Service]
+Type=simple
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/python main.py
-Restart=always
+ExecStart=$PY main.py
+Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1
-systemctl restart "$SERVICE"
+  systemctl daemon-reload
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE"
+
+  say "Starting the bot..."
+  ONLINE=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 2
+    if ! systemctl is-active --quiet "$SERVICE"; then break; fi
+    if journalctl -u "$SERVICE" --since "-2min" --no-pager 2>/dev/null | grep -q "Logged in as"; then ONLINE=1; break; fi
+  done
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null || true
+    die "The bot stopped right after starting. The log above shows why. Send it to get help."
+  fi
+  [ "$ONLINE" -eq 1 ] && say "The bot is online in Discord." || warn "The bot is running but has not logged in yet. Check: journalctl -u $SERVICE -f"
+else
+  warn "systemd was not found. Starting the bot in the background instead (it will not auto-start after a reboot)."
+  if command -v pkill >/dev/null 2>&1; then pkill -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 || true; fi
+  (cd "$INSTALL_DIR" && nohup "$PY" main.py >> "$INSTALL_DIR/bot.log" 2>&1 &)
+  say "Logs: tail -f $INSTALL_DIR/bot.log"
+fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   say "Opening SSH ports $PORT_START-$PORT_END in ufw..."
   ufw allow "$PORT_START:$PORT_END/tcp" >/dev/null
 fi
 
-say "Done! ALOOZ HOSTING bot is running."
+echo
+say "All done! ALOOZ HOSTING bot is installed."
+if [ -n "$BOT_ID" ]; then
+  echo "  1) Add the bot to your Discord server with this link:"
+  echo "     https://discord.com/oauth2/authorize?client_id=$BOT_ID&scope=bot+applications.commands&permissions=0"
+  echo "  2) Type / in your server and use /deploy"
+fi
 echo "  Live logs:  journalctl -u $SERVICE -f"
 echo "  Restart:    systemctl restart $SERVICE"
 echo "  Update:     run the same install command again"
