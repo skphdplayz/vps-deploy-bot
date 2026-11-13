@@ -1426,11 +1426,18 @@ EOF
     if ! systemctl is-active --quiet "$SERVICE"; then break; fi
     if journalctl -u "$SERVICE" --since "-2min" --no-pager 2>/dev/null | grep -q "Logged in as"; then ONLINE=1; break; fi
   done
+  
   if ! systemctl is-active --quiet "$SERVICE"; then
-    journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null || true
-    die "The bot stopped right after starting. The log above shows why. Send it to get help."
+    echo -e "\n\033[1;31m[ERROR] The bot failed to start. Here is the error log:\033[0m"
+    journalctl -u "$SERVICE" -n 20 --no-pager 2>/dev/null || true
+    echo -e "\n\033[1;33m[FIX] Please read the error above. Most common reasons:\033[0m"
+    echo " - Docker is not running properly. Try: systemctl restart docker"
+    echo " - Your VPS is OpenVZ, which doesn't support Docker. Use a KVM VPS."
+    echo " - Invalid Discord token in /opt/alooz-bot/.env"
+    exit 1
+  else
+    [ "$ONLINE" -eq 1 ] && say "The bot is online in Discord." || warn "The bot is running but has not logged in yet. Check: journalctl -u $SERVICE -f"
   fi
-  [ "$ONLINE" -eq 1 ] && say "The bot is online in Discord." || warn "The bot is running but has not logged in yet. Check: journalctl -u $SERVICE -f"
 else
   warn "systemd was not found. Starting the bot in the background instead (it will not auto-start after a reboot)."
   if command -v pkill >/dev/null 2>&1; then pkill -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 || true; fi
