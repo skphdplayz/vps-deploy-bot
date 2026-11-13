@@ -123,11 +123,21 @@ ask() { # ask VARIABLE "Question" [secret]
   printf -v "$var" '%s' "$value"
 }
 
-say "Installing system packages (python3, docker)..."
+say "Installing system packages (python3, curl)..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl python3 python3-pip python3-venv docker.io >/dev/null
+apt-get install -y curl python3 python3-pip python3-venv \
+  || die "Could not install python3/curl. Fix apt first: apt --fix-broken install   (and check: apt-mark showhold)"
+
+if command -v docker >/dev/null 2>&1; then
+  say "Docker is already installed, skipping."
+else
+  say "Installing Docker..."
+  apt-get install -y docker.io \
+    || die "Could not install docker.io (package conflict). Run: dpkg -l | grep -E 'docker|containerd'  and  apt-mark showhold"
+fi
 systemctl enable --now docker >/dev/null 2>&1 || true
+docker info >/dev/null 2>&1 || die "Docker is installed but not running. Check: systemctl status docker"
 
 say "Writing bot files to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
